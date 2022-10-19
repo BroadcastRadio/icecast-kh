@@ -315,19 +315,28 @@ static auth_result auth_cmd_client (auth_client *auth_user)
             referer = (char*)httpp_getvar (client->parser, "referer");
             if (referer)
                 referer = util_url_escape (referer);
+
+            ice_config_t *config = config_get_config_unlocked();
+
             len = snprintf (str, sizeof(str),
                     "Mountpoint: %s%s\n"
                     "User: %s\n"
                     "Pass: %s\n"
                     "IP: %s\n"
                     "Agent: %s\n"
-                    "Referer: %s\n\n",
+                    "Referer: %s\n"
+                    "Location: %s\n"
+                    "Listeners: %d\n"
+                    "Protocol: %s\n",
                     auth_user->mount, qargs ? qargs : "",
                     client->username ? client->username : "",
                     client->password ? client->password : "",
                     client->connection.ip,
                     agent ? agent : "",
-                    referer ? referer : "");
+                    referer ? referer : "",
+                    config->location,
+                    global.listeners,
+                    not_ssl_connection (&client->connection) ? "http" : "https");
             free (agent);
             free (referer);
             write (outfd[1], str, len);
