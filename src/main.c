@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -96,9 +97,9 @@ static void _print_usage(void)
 
 void initialize_subsystems(void)
 {
-    global_initialize();
-    thread_initialize();
     log_initialize_lib (thread_mtx_create_callback, thread_mtx_lock_callback);
+    thread_initialize();
+    global_initialize();
     errorlog = log_open_file (stderr);
     sock_initialize();
     resolver_initialize();

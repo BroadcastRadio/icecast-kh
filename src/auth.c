@@ -3,14 +3,15 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>,
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
  */
 
-/** 
+/**
  * Client authentication functions
  */
 
@@ -126,7 +127,11 @@ static auth_client *auth_client_setup (const char *mount, client_t *client)
     auth_user->port = config->port;
     auth_user->client = client;
     if (client)
-        client->mount = auth_user->mount;
+    {
+        auth_user->flags = client->flags;
+        if (client->mount == NULL)
+            client->mount = auth_user->mount;
+    }
     return auth_user;
 }
 
@@ -140,6 +145,8 @@ static void queue_auth_client (auth_client *auth_user, mount_proxy *mountinfo)
     if (auth_user == NULL || mountinfo == NULL)
         return;
     auth = mountinfo->auth;
+    if (auth_user->client)
+        auth_user->client->worker = NULL;
     thread_mutex_lock (&auth->lock);
     auth_user->next = NULL;
     auth_user->auth = auth;
@@ -281,10 +288,13 @@ static void auth_remove_listener (auth_client *auth_user)
         client_t *client = auth_user->client;
         client->flags &= ~CLIENT_AUTHENTICATED;
         DEBUG1 ("client #%" PRIu64 " completed", client->connection.id);
-        if (client->worker)
+        thread_rwlock_rlock (&workers_lock);
+        worker_t *worker = client->worker;
+        if (worker)
             client_send_404 (client, NULL);
         else
             client_destroy (auth_user->client);
+        thread_rwlock_unlock (&workers_lock);
         auth_user->client = NULL;
     }
 }
@@ -300,10 +310,9 @@ static void stream_auth_callback (auth_client *auth_user)
     if (auth_user->auth->stream_auth)
         auth_user->auth->stream_auth (auth_user);
 
-    if (client->flags & CLIENT_AUTHENTICATED)
-        auth_postprocess_source (auth_user);
-    else
-        WARN1 ("Failed auth for source \"%s\"", auth_user->mount);
+    client->flags = auth_user->flags;
+
+    auth_postprocess_source (auth_user);
 }
 
 
@@ -320,6 +329,7 @@ static void stream_start_callback (auth_client *auth_user)
     {
         client_t *client = auth_user->client;
         free (client->connection.ip);
+        refbuf_release (client->refbuf);
         free (client->shared_data); // useragent
         free (client);
         auth_user->client = NULL;
@@ -340,6 +350,7 @@ static void stream_end_callback (auth_client *auth_user)
     {
         client_t *client = auth_user->client;
         free (client->connection.ip);
+        refbuf_release (client->refbuf);
         free (client->shared_data); // useragent
         free (client);
         auth_user->client = NULL;
@@ -397,25 +408,24 @@ int move_listener (client_t *client, struct _fbinfo *finfo)
     source_t *source;
     mount_proxy *minfo;
     int rate = finfo->limit, loop = 20, ret = -1;
-    ice_config_t *config = config_get_config();
     struct _fbinfo where;
     unsigned int len = 4096;
     char buffer [len];
 
     memcpy (&where, finfo, sizeof (where));
-    if (finfo->fallback)
-        where.fallback = strdup (finfo->fallback);
+    if (finfo->override)
+        where.override = strdup (finfo->override);
     avl_tree_rlock (global.source_tree);
     do
     {
         len = sizeof buffer;
-        util_expand_pattern (where.fallback, where.mount, buffer, &len);
+        util_expand_pattern (where.override, where.mount, buffer, &len);
         where.mount = buffer;
 
-        minfo = config_find_mount (config, where.mount);
+        minfo = config_lock_mount (NULL, where.mount);
 
         if (rate == 0 && minfo && minfo->limit_rate)
-            rate = minfo->limit_rate;
+            rate = minfo->limit_rate/8;
         source = source_find_mount_raw (where.mount);
 
         if (source == NULL && minfo == NULL)
@@ -428,30 +438,30 @@ int move_listener (client_t *client, struct _fbinfo *finfo)
                 // an unused on-demand relay will still have an unitialised type
                 if (source->format->type == finfo->type || source->format->type == FORMAT_TYPE_UNDEFINED)
                 {
-                    config_release_config();
+                    config_mount_ref (minfo, 0);
                     avl_tree_unlock (global.source_tree);
                     source_setup_listener (source, client);
                     source->listeners++;
                     client->flags |= CLIENT_HAS_MOVED;
                     thread_rwlock_unlock (&source->lock);
-                    free (where.fallback);
+                    free (where.override);
                     return 0;
                 }
             }
             thread_rwlock_unlock (&source->lock);
         }
-        if (minfo && minfo->fallback_mount)
+        if (minfo && minfo->fallback.mount)
         {
-            free (where.fallback);
-            where.fallback = strdup (where.mount);
-            where.mount = minfo->fallback_mount;
+            free (where.override);
+            where.override = strdup (where.mount);
+            where.mount = minfo->fallback.mount;
         }
         else
             break;
     } while (loop--);
 
     avl_tree_unlock (global.source_tree);
-    config_release_config();
+    config_mount_ref (minfo, 0);
     if (where.mount && ((client->flags & CLIENT_IS_SLAVE) == 0))
     {
         if (where.limit == 0)
@@ -464,7 +474,7 @@ int move_listener (client_t *client, struct _fbinfo *finfo)
         client->intro_offset = 0;
         ret = fserve_setup_client_fb (client, &where);
     }
-    free (where.fallback);
+    free (where.override);
     return ret;
 }
 
@@ -472,6 +482,8 @@ int move_listener (client_t *client, struct _fbinfo *finfo)
 /* Add listener to the pending lists of either the source or fserve thread. This can be run
  * from the connection or auth thread context. return -1 to indicate that client has been
  * terminated, 0 for receiving content.
+ *
+ * Drop count on mountinfo on exit.
  */
 static int add_authenticated_listener (const char *mount, mount_proxy *mountinfo, client_t *client)
 {
@@ -490,16 +502,20 @@ static int add_authenticated_listener (const char *mount, mount_proxy *mountinfo
         client->flags |= CLIENT_IS_SLAVE;
         if (client->parser->req_type == httpp_req_stats)
         {
+            config_release_mount (mountinfo);
             stats_add_listener (client, STATS_SLAVE|STATS_GENERAL);
             return 0;
         }
         mount = httpp_get_query_param (client->parser, "mount");
         if (mount == NULL)
         {
+            config_release_mount (mountinfo);
             command_list_mounts (client, TEXT);
             return 0;
         }
-        mountinfo = config_find_mount (config_get_config_unlocked(), mount);
+        mount_proxy *m = config_lock_mount (NULL, mount);
+        config_release_mount (mountinfo);
+        mountinfo = m;
     }
 
     /* Here we are parsing the URI request to see if the extension is .xsl, if
@@ -508,6 +524,7 @@ static int add_authenticated_listener (const char *mount, mount_proxy *mountinfo
     if (util_check_valid_extension (mount) == XSLT_CONTENT)
     {
         /* If the file exists, then transform it, otherwise, write a 404 */
+        config_release_mount (mountinfo);
         DEBUG0("Stats request, sending XSL transformed stats");
         return stats_transform_xslt (client, mount);
     }
@@ -525,6 +542,7 @@ static int add_authenticated_listener (const char *mount, mount_proxy *mountinfo
         client->mount = mount;
         ret = fserve_client_create (client, mount);
     }
+    config_release_mount (mountinfo);
     return ret;
 }
 
@@ -534,14 +552,15 @@ static int auth_postprocess_listener (auth_client *auth_user)
     int ret;
     client_t *client = auth_user->client;
     auth_t *auth = auth_user->auth;
-    ice_config_t *config;
     mount_proxy *mountinfo;
     const char *mount = auth_user->mount;
 
     if (client == NULL)
         return 0;
 
-    if ((client->flags & CLIENT_AUTHENTICATED) == 0)
+    client->flags = auth_user->flags;
+
+    if ((auth_user->flags & CLIENT_AUTHENTICATED) == 0)
     {
         /* auth failed so do we place the listener elsewhere */
         auth_user->client = NULL;
@@ -554,10 +573,8 @@ static int auth_postprocess_listener (auth_client *auth_user)
             return -1;
         }
     }
-    config = config_get_config();
-    mountinfo = config_find_mount (config, mount);
+    mountinfo = config_lock_mount (NULL, mount);
     ret = add_authenticated_listener (mount, mountinfo, client);
-    config_release_config();
     auth_user->client = NULL;
 
     return ret;
@@ -569,23 +586,26 @@ static int auth_postprocess_listener (auth_client *auth_user)
  */
 void auth_postprocess_source (auth_client *auth_user)
 {
-    client_t *client = auth_user->client;
-    const char *mount = auth_user->mount;
-    const char *req = httpp_getvar (client->parser, HTTPP_VAR_URI);
+    if (auth_user->flags & CLIENT_AUTHENTICATED)
+    {
+        client_t *client = auth_user->client;
+        const char *mount = auth_user->mount;
+        const char *req = httpp_getvar (client->parser, HTTPP_VAR_URI);
 
-    auth_user->client = NULL;
-    if (strcmp (req, "/admin.cgi") == 0 || strncmp ("/admin/metadata", req, 15) == 0)
-    {
-        DEBUG2 ("metadata request (%s, %s)", req, mount);
-        client->mount = mount;
-        client->aux_data = (int64_t)strdup("metadata");
-        admin_mount_request (client);
+        auth_user->client = NULL;
+        if (strcmp (req, "/admin.cgi") == 0 || strncmp ("/admin/metadata", req, 15) == 0)
+        {
+            DEBUG2 ("metadata request (%s, %s)", req, mount);
+            admin_mount_request (client);
+        }
+        else
+        {
+            DEBUG1 ("on mountpoint %s", mount);
+            source_startup (client, mount);
+        }
+        return;
     }
-    else
-    {
-        DEBUG1 ("on mountpoint %s", mount);
-        source_startup (client, mount);
-    }
+    WARN1 ("Failed auth attempt for source \"%s\"", auth_user->mount);
 }
 
 
@@ -595,8 +615,7 @@ void auth_postprocess_source (auth_client *auth_user)
 int auth_add_listener (const char *mount, client_t *client)
 {
     int ret = 0, need_auth = 1;
-    ice_config_t *config = config_get_config();
-    mount_proxy *mountinfo = config_find_mount (config, mount);
+    mount_proxy *mountinfo = config_lock_mount (NULL, mount);
 
     if (client->flags & CLIENT_AUTHENTICATED)
         need_auth = 0;
@@ -619,7 +638,7 @@ int auth_add_listener (const char *mount, client_t *client)
                 pos2 = 0;
             }
 
-            if (pos2 >= 0 && pos1 <= pos2)
+            if (pos1 <= pos2)
             {
                 client->intro_offset = pos1;
                 client->connection.discon.offset = pos2;
@@ -653,7 +672,7 @@ int auth_add_listener (const char *mount, client_t *client)
             }
             if (mountinfo->no_mount)
             {
-                config_release_config ();
+                config_release_mount (mountinfo);
                 return client_send_403 (client, "mountpoint unavailable");
             }
             if (mountinfo->redirect)
@@ -663,10 +682,11 @@ int auth_add_listener (const char *mount, client_t *client)
 
                 if (util_expand_pattern (mount, mountinfo->redirect, buffer, &len) == 0)
                 {
-                    config_release_config ();
+                    config_release_mount (mountinfo);
                     return client_send_302 (client, buffer);
                 }
                 WARN3 ("failed to expand %s on %s for %s", mountinfo->redirect, mountinfo->mountname, mount);
+                config_release_mount (mountinfo);
                 return client_send_501 (client);
             }
             do
@@ -676,7 +696,7 @@ int auth_add_listener (const char *mount, client_t *client)
                 if (auth->pending_count > 400)
                 {
                     if (auth->flags & AUTH_SKIP_IF_SLOW) break;
-                    config_release_config ();
+                    config_release_mount (mountinfo);
                     WARN0 ("too many clients awaiting authentication");
                     if (global.new_connections_slowdown < 10)
                         global.new_connections_slowdown++;
@@ -686,11 +706,10 @@ int auth_add_listener (const char *mount, client_t *client)
                 {
                     auth_client *auth_user = auth_client_setup (mount, client);
                     auth_user->process = auth_new_listener;
-                    client->flags &= ~CLIENT_ACTIVE;
                     DEBUG1 ("adding client #%" PRIu64 " for authentication", client->connection.id);
                     queue_auth_client (auth_user, mountinfo);
-                    config_release_config ();
-                    return 0;
+                    config_release_mount (mountinfo);
+                    return 1;
                 }
             } while (0);
         }
@@ -698,13 +717,12 @@ int auth_add_listener (const char *mount, client_t *client)
         {
             if (strcmp (mount, "/admin/streams") == 0)
             {
-                config_release_config ();
+                config_release_mount (mountinfo);
                 return client_send_401 (client, NULL);
             }
         }
     }
     ret = add_authenticated_listener (mount, mountinfo, client);
-    config_release_config ();
     return ret;
 }
 
@@ -721,12 +739,10 @@ int auth_release_listener (client_t *client, const char *mount, mount_proxy *mou
         if (mount && mountinfo && mountinfo->auth && mountinfo->auth->release_listener)
         {
             auth_client *auth_user = auth_client_setup (mount, client);
-            client->flags &= ~CLIENT_ACTIVE;
-            if (client->worker)
-                client->ops = &auth_release_ops; // put into a wait state
+            client->ops = &auth_release_ops; // put into a wait state
             auth_user->process = auth_remove_listener;
             queue_auth_client (auth_user, mountinfo);
-            return 0;
+            return 1;
         }
         client->flags &= ~CLIENT_AUTHENTICATED;
     }
@@ -747,14 +763,9 @@ static int get_authenticator (auth_t *auth, config_options_t *options)
 
         if (strcmp (auth->type, "url") == 0)
         {
-#ifdef HAVE_AUTH_URL
             if (auth_get_url_auth (auth, options) < 0)
                 return -1;
             break;
-#else
-            ERROR0 ("Auth URL disabled, no libcurl support");
-            return -1;
-#endif
         }
         if (strcmp (auth->type, "command") == 0)
         {
@@ -798,77 +809,23 @@ static int get_authenticator (auth_t *auth, config_options_t *options)
 }
 
 
-int auth_get_authenticator (xmlNodePtr node, void *x)
+int auth_get_authenticator (auth_t *auth, config_options_t *options)
 {
-    auth_t *auth = calloc (1, sizeof (auth_t));
-    config_options_t *options = NULL, **next_option = &options;
-    xmlNodePtr option;
-    int i;
-
-    if (auth == NULL)
-        return -1;
-
-    option = node->xmlChildrenNode;
-    while (option)
-    {
-        xmlNodePtr current = option;
-        option = option->next;
-        if (xmlStrcmp (current->name, XMLSTR("option")) == 0)
-        {
-            config_options_t *opt = calloc (1, sizeof (config_options_t));
-            opt->name = (char *)xmlGetProp (current, XMLSTR("name"));
-            if (opt->name == NULL)
-            {
-                free(opt);
-                continue;
-            }
-            opt->value = (char *)xmlGetProp (current, XMLSTR("value"));
-            if (opt->value == NULL)
-            {
-                xmlFree (opt->name);
-                free (opt);
-                continue;
-            }
-            *next_option = opt;
-            next_option = &opt->next;
-        }
-        else
-            if (xmlStrcmp (current->name, XMLSTR("text")) != 0)
-                WARN1 ("unknown auth setting (%s)", current->name);
-    }
-    auth->type = (char *)xmlGetProp (node, XMLSTR("type"));
+    thread_mutex_create (&auth->lock);
+    auth->refcount = 1;
     if (get_authenticator (auth, options) < 0)
-    {
-        xmlFree (auth->type);
-        free (auth);
-        auth = NULL;
-    }
-    else
-    {
-        auth->tailp = &auth->head;
-        thread_mutex_create (&auth->lock);
+        return -1;
+    auth->tailp = &auth->head;
 
-        /* allocate N threads */
-        auth->handles = calloc (auth->handlers, sizeof (auth_thread_t));
-        auth->refcount = 1;
-        auth->flags |= (AUTH_RUNNING|AUTH_CLEAN_ENV);
-        for (i=0; i<auth->handlers; i++)
-        {
-            if (auth->alloc_thread_data)
-                auth->handles[i].data = auth->alloc_thread_data (auth);
-            auth->handles[i].id = thread_id++;
-            auth->handles[i].auth = auth;
-        }
-        *(auth_t**)x = auth;
-    }
-
-    while (options)
+    /* allocate N threads */
+    auth->handles = calloc (auth->handlers, sizeof (auth_thread_t));
+    auth->flags |= (AUTH_RUNNING|AUTH_CLEAN_ENV);
+    for (int i=0; i<auth->handlers; i++)
     {
-        config_options_t *opt = options;
-        options = opt->next;
-        xmlFree (opt->name);
-        xmlFree (opt->value);
-        free (opt);
+        if (auth->alloc_thread_data)
+            auth->handles[i].data = auth->alloc_thread_data (auth);
+        auth->handles[i].id = thread_id++;
+        auth->handles[i].auth = auth;
     }
     return 0;
 }
@@ -886,7 +843,6 @@ int auth_stream_authenticate (client_t *client, const char *mount, mount_proxy *
 
         auth_user->process = stream_auth_callback;
         INFO1 ("request source auth for \"%s\"", mount);
-        client->flags &= ~CLIENT_ACTIVE;
         queue_auth_client (auth_user, mountinfo);
         return 1;
     }
@@ -961,6 +917,8 @@ int auth_check_source (client_t *client, const char *mount)
         if (mountinfo)
         {
             ret = 1;
+            if (mountinfo->hijack)
+                client->flags |= CLIENT_HIJACKER;
             if (auth_stream_authenticate (client, mount, mountinfo) > 0)
                 break;
             ret = -1;

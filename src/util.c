@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -37,6 +38,8 @@
 #endif
 #ifdef HAVE_FNMATCH_H
 #include <fnmatch.h>
+#else
+#define FNM_CASEFOLD    1
 #endif
 
 #include "net/sock.h"
@@ -107,52 +110,6 @@ int util_timed_wait_for_fd(sock_t fd, int timeout)
 #endif
 }
 
-int util_read_header(sock_t sock, char *buff, unsigned long len, int entire)
-{
-    int read_bytes, ret;
-    unsigned long pos;
-    char c;
-    ice_config_t *config;
-    int header_timeout;
-
-    config = config_get_config();
-    header_timeout = config->header_timeout;
-    config_release_config();
-
-    read_bytes = 1;
-    pos = 0;
-    ret = 0;
-
-    while ((read_bytes == 1) && (pos < (len - 1))) {
-        read_bytes = 0;
-
-        if (util_timed_wait_for_fd(sock, header_timeout*1000) > 0) {
-
-            if ((read_bytes = recv(sock, &c, 1, 0)) > 0) {
-                if (c != '\r') buff[pos++] = c;
-                if (entire) {
-                    if ((pos > 1) && (buff[pos - 1] == '\n' && 
-                                      buff[pos - 2] == '\n')) {
-                        ret = 1;
-                        break;
-                    }
-                }
-                else {
-                    if ((pos > 1) && (buff[pos - 1] == '\n')) {
-                        ret = 1;
-                        break;
-                    }
-                }
-            }
-        } else {
-            break;
-        }
-    }
-
-    if (ret) buff[pos] = '\0';
-    
-    return ret;
-}
 
 char *util_get_extension(const char *path) {
     char *ext = strrchr(path, '.');
@@ -242,6 +199,7 @@ static int verify_path(char *path) {
     return 1;
 }
 
+#if 0
 char *util_get_path_from_uri(char *uri) {
     char *path = util_normalise_uri(uri);
     char *fullpath;
@@ -254,12 +212,14 @@ char *util_get_path_from_uri(char *uri) {
         return fullpath;
     }
 }
+#endif
 
+// requires config lock on entry.
 char *util_get_path_from_normalised_uri(const char *uri, int use_admin)
 {
     char *fullpath;
     char *root;
-    ice_config_t *config = config_get_config();
+    ice_config_t *config = config_get_config_unlocked();
 
     if (use_admin)
         root = config->adminroot_dir;
@@ -269,7 +229,6 @@ char *util_get_path_from_normalised_uri(const char *uri, int use_admin)
     fullpath = malloc(strlen(uri) + strlen(root) + 1);
     if (fullpath)
         sprintf (fullpath, "%s%s", root, uri);
-    config_release_config();
 
     return fullpath;
 }
@@ -443,9 +402,8 @@ char *util_bin_to_hex(unsigned char *data, int len)
 }
 
 /* This isn't efficient, but it doesn't need to be */
-char *util_base64_encode(const char *data)
+char *util_base64_encode_len (const char *data, int len)
 {
-    int len = strlen(data);
     char *out = malloc(len*4/3 + 4);
     char *result = out;
     int chunk;
@@ -475,6 +433,13 @@ char *util_base64_encode(const char *data)
 
     return result;
 }
+
+
+char *util_base64_encode (const char *data)
+{
+     return util_base64_encode_len (data, strlen(data));
+}
+
 
 char *util_base64_decode(const char *data)
 {
@@ -963,10 +928,16 @@ int get_line(FILE *file, char *buf, size_t siz)
 }
 
 
-int cached_pattern_compare (const char *value, const char *pattern)
+int cached_pattern_match (void *arg, const char *value, const char *pattern)
 {
+    cache_file_contents *c = arg;
+    int flags = (c) ? c->flags_cmp : 0;
 #ifdef HAVE_FNMATCH_H
-    int x = fnmatch (pattern, value, FNM_NOESCAPE);
+#ifndef FNM_EXTMATCH
+#define FNM_EXTMATCH 0
+#endif
+    flags |= (FNM_NOESCAPE|FNM_EXTMATCH);
+    int x = fnmatch (pattern, value, flags);
     switch (x)
     {
         case FNM_NOMATCH:
@@ -978,7 +949,8 @@ int cached_pattern_compare (const char *value, const char *pattern)
     }
     return -1;
 #else
-    return strcmp (pattern, value);
+    int (*cmp)(const char *p, const char *v) = flags ? strcasecmp : strcmp;
+    return (*cmp)(pattern, value);
 #endif
 }
 
@@ -1111,7 +1083,7 @@ int cached_pattern_search (cache_file_contents *cache, const char *line, time_t 
             struct cache_list_node *entry = cache->extra;
             while (entry)
             {
-                if (cached_pattern_compare (line, entry->content) == 0)
+                if (cached_pattern_match (cache, line, entry->content) == 0)
                 {
                     DEBUG1 ("%s matched pattern", line);
                     return 1;
@@ -1143,12 +1115,19 @@ void cached_file_clear (cache_file_contents *cache)
 }
 
 
+void cached_file_settings (cache_file_contents *cache, unsigned int flags)
+{
+    if (flags & CACHED_IGNORECASE) cache->flags_cmp |= FNM_CASEFOLD;
+}
+
+
 void cached_file_init (cache_file_contents *cache, const char *filename, cachefile_add_func add, cachefile_compare_func compare)
 {
     if (filename == NULL || cache == NULL)
         return;
     cache->filename = strdup (filename);
     cache->file_mtime = 0;
+    cache->flags_cmp = 0;
     cache->add = add ? add : add_generic_text;
     cache->compare = compare ? compare : cached_text_compare;
 }
@@ -1231,6 +1210,38 @@ int util_get_clf_time (char *buffer, unsigned len, time_t now)
     return r;
 }
 
+#endif
+
+#ifndef HAVE_MEMMEM
+// cut from libiberty as-is
+/* Return the first occurrence of NEEDLE in HAYSTACK.  */
+void *
+memmem (const void *haystack, size_t haystack_len, const void *needle,
+	size_t needle_len)
+{
+  const char *begin;
+  const char *const last_possible
+    = (const char *) haystack + haystack_len - needle_len;
+
+  if (needle_len == 0)
+    /* The first occurrence of the empty string is deemed to occur at
+       the beginning of the string.  */
+    return (void *) haystack;
+
+  /* Sanity check, otherwise the loop might search through the whole
+     memory.  */
+  if (__builtin_expect (haystack_len < needle_len, 0))
+    return NULL;
+
+  for (begin = (const char *) haystack; begin <= last_possible; ++begin)
+    if (begin[0] == ((const char *) needle)[0] &&
+	!memcmp ((const void *) &begin[1],
+		 (const void *) ((const char *) needle + 1),
+		 needle_len - 1))
+      return (void *) begin;
+
+  return NULL;
+}
 #endif
 
 

@@ -3,7 +3,8 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
- * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
@@ -79,15 +80,21 @@ struct connection_bufs
 #else
 #define not_ssl_connection(x)    (1)
 #endif
+
+#define PRI_ConnID   PRIu64
+
+#define CONN_ID(x)              ((x)->connection.id)
+#define CONN_ADDR(x)            (&(x)->connection.ip[0])
+
 void connection_initialize(void);
 void connection_shutdown(void);
 void connection_thread_startup();
 void connection_thread_shutdown();
 int  connection_setup_sockets (struct ice_config_tag *config);
-void connection_reset (connection_t *con, uint64_t time_ms);
+int  connection_reset (connection_t *con, uint64_t time_ms);
 void connection_close(connection_t *con);
 int  connection_init (connection_t *con, sock_t sock, const char *addr);
-void connection_uses_ssl (connection_t *con);
+int  connection_uses_ssl (connection_t *con, int accept_state);
 void connection_add_banned_ip (const char *ip, int duration);
 void connection_release_banned_ip (const char *ip);
 void connection_stats (void);
@@ -121,7 +128,5 @@ int connection_check_admin_pass(http_parser_t *parser);
 
 void connection_close_sigfd (void);
 void connection_listen_sockets_close (struct ice_config_tag *config, int all_sockets);
-
-extern int connection_running;
 
 #endif  /* __CONNECTION_H__ */

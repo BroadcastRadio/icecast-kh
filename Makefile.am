@@ -3,8 +3,8 @@
 ACLOCAL_AMFLAGS = -I m4
 
 SUBDIRS = conf doc web admin src
-if WIN32
-SUBDIRS += win32
+if WINDOWS
+SUBDIRS += windows
 endif
 
 BUILT_SOURCES = git_hash.h
@@ -26,6 +26,10 @@ FORCE:
 debug:
 	$(MAKE) all CFLAGS="-Wno-unused-parameter @DEBUG@"
 
+win64:
+	$(MAKE) all CFLAGS="-O2 -s" CXXFLAGS="-O2 -s"
+win32:
+	$(MAKE) all CFLAGS="-O2 -s" CXXFLAGS="-O2 -s"
 profile:
 	$(MAKE) all CFLAGS="@PROFILE@"
 

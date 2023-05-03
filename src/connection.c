@@ -3,12 +3,12 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
+ * Copyright 2010-2022, Karl Heyes <karl@kheyes.plus.com>
  * Copyright 2000-2004, Jack Moffitt <jack@xiph.org>,
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
- * Copyright 2000-2017, Karl Heyes <karl@kheyes.plus.com>
  */
 
 /* -*- c-basic-offset: 4; indent-tabs-mode: nil; -*- */
@@ -25,6 +25,7 @@
 #endif
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <ctype.h>
 #include <fnmatch.h>
 
 #ifdef _MSC_VER
@@ -158,7 +159,7 @@ cache_file_contents banned_ip, allowed_ip;
 /* filtering listener connection based on useragent */
 cache_file_contents useragents;
 
-int connection_running = 0;
+volatile sig_atomic_t connection_running = 0;
 
 
 // Generated using `openssl dhparam -C -2 2048`
@@ -258,7 +259,7 @@ void connection_initialize(void)
     SSL_load_error_strings();                /* readable error messages */
 #endif
     SSL_library_init();                      /* initialize library */
-    ssl_mutexes = malloc(CRYPTO_num_locks() * sizeof(mutex_t));
+    ssl_mutexes = calloc(CRYPTO_num_locks(),  sizeof(mutex_t));
     if (ssl_mutexes)
     {
         int i;
@@ -342,9 +343,9 @@ static void get_ssl_certificate (ice_config_t *config)
             break;
 
 #if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-        new_ssl_ctx = SSL_CTX_new (TLS_server_method());
+        new_ssl_ctx = SSL_CTX_new (TLS_method());
 #else
-        new_ssl_ctx = SSL_CTX_new (SSLv23_server_method());
+        new_ssl_ctx = SSL_CTX_new (SSLv23_method());
 #endif
         ssl_opts = SSL_CTX_get_options (new_ssl_ctx);
         SSL_CTX_set_options (new_ssl_ctx, ssl_opts|SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3|SSL_OP_NO_COMPRESSION|SSL_OP_CIPHER_SERVER_PREFERENCE|SSL_OP_ALL);
@@ -494,6 +495,7 @@ static void get_ssl_certificate (ice_config_t *config)
 }
 #endif /* HAVE_OPENSSL */
 
+
 int connection_unreadable (connection_t *con)
 {
     if (((++con->readchk) & 15) == 15)
@@ -507,6 +509,7 @@ int connection_unreadable (connection_t *con)
     }
     return 0;
 }
+
 
 /* handlers (default) for reading and writing a connection_t, no encrpytion
  * used just straight access to the socket
@@ -787,7 +790,11 @@ static int search_banned_ip_locked (char *ip)
 static int search_banned_ip (char *ip)
 {
     int ret;
-    cached_file_recheck (&banned_ip, cachefile_timecheck);
+    thread_spin_lock (&_connection_lock);
+    time_t t = cachefile_timecheck;
+    thread_spin_unlock (&_connection_lock);
+
+    cached_file_recheck (&banned_ip, t);
     global_lock();
     ret = search_banned_ip_locked (ip);
     global_unlock();
@@ -798,14 +805,17 @@ static int search_banned_ip (char *ip)
 /* return 0 if the passed ip address is not to be handled by icecast, non-zero otherwise */
 static int accept_ip_address (char *ip)
 {
-    cachefile_timecheck = time (NULL);
+    time_t t = time (NULL);
+    thread_spin_lock (&_connection_lock);
+    cachefile_timecheck = t;
+    thread_spin_unlock (&_connection_lock);
 
     if (search_banned_ip (ip) > 0)
     {
         DEBUG1 ("%s banned", ip);
         return 0;
     }
-    if (cached_pattern_search (&allowed_ip, ip, cachefile_timecheck) == 0)
+    if (cached_pattern_search (&allowed_ip, ip, t) == 0)
     {
         DEBUG1 ("%s is not allowed", ip);
         return 0;
@@ -827,44 +837,56 @@ static struct xforward_entry *_find_xforward_addr (ice_config_t *config, char *i
 }
 
 
+static int _set_connection_peer (connection_t *con, sock_t sock)
+{
+    struct sockaddr_storage sa;
+    socklen_t slen = sizeof (sa);
+
+    if (getpeername (sock, (struct sockaddr *)&sa, &slen) == 0)
+    {
+        char *ip;
+#ifdef HAVE_GETNAMEINFO
+        char buffer [200] = "unknown";
+        getnameinfo ((struct sockaddr *)&sa, slen, buffer, 200, NULL, 0, NI_NUMERICHOST);
+        if (strncmp (buffer, "::ffff:", 7) == 0)
+            ip = strdup (buffer+7);
+        else
+            ip = strdup (buffer);
+#else
+        int len = 30;
+        ip = malloc (len);
+        strncpy (ip, inet_ntoa (((struct sockaddr_in*)&sa)->sin_addr), len);
+#endif
+        free (con->ip);
+        if (accept_ip_address (ip))
+        {
+            con->ip = ip;
+            return 0;
+        }
+        con->ip = NULL;
+        free (ip);
+    }
+    return -1;
+}
+
+
 int connection_init (connection_t *con, sock_t sock, const char *addr)
 {
     if (con)
     {
-        struct sockaddr_storage sa;
-        socklen_t slen = sizeof (sa);
-
         con->sock = sock;
         if (sock == SOCK_ERROR)
             return -1;
         con->id = _next_connection_id();
         if (addr)
         {
+            free (con->ip);
             con->ip = strdup (addr + (strncmp (addr, "::ffff:", 7) == 0 ? 7: 0));
             return 0;
         }
-        if (getpeername (sock, (struct sockaddr *)&sa, &slen) == 0)
-        {
-            char *ip;
-#ifdef HAVE_GETNAMEINFO
-            char buffer [200] = "unknown";
-            getnameinfo ((struct sockaddr *)&sa, slen, buffer, 200, NULL, 0, NI_NUMERICHOST);
-            if (strncmp (buffer, "::ffff:", 7) == 0)
-                ip = strdup (buffer+7);
-            else
-                ip = strdup (buffer);
-#else
-            int len = 30;
-            ip = malloc (len);
-            strncpy (ip, inet_ntoa (((struct sockaddr_in*)&sa)->sin_addr), len);
-#endif
-            if (accept_ip_address (ip))
-            {
-                con->ip = ip;
-                return 0;
-            }
-            free (ip);
-        }
+        if (_set_connection_peer (con, sock) == 0)
+            return 0;
+        free (con->ip);
         memset (con, 0, sizeof (connection_t));
         con->sock = SOCK_ERROR;
     }
@@ -874,45 +896,55 @@ int connection_init (connection_t *con, sock_t sock, const char *addr)
 
 /* prepare connection for interacting over a SSL connection
  */
-void connection_uses_ssl (connection_t *con)
+int connection_uses_ssl (connection_t *con, int accept_state)
 {
 #ifdef HAVE_OPENSSL
+    int ret;
     if (ssl_ctx == NULL)
     {
         DEBUG1 ("Detected SSL on connection from %s, but SSL not defined", con->ip);
         con->error = 1;
-        return;
+        return -1;
     }
     con->ssl = SSL_new (ssl_ctx);
-    SSL_set_accept_state (con->ssl);
-    SSL_set_fd (con->ssl, con->sock);
+    ret = SSL_set_fd (con->ssl, con->sock);
+    if (accept_state)
+        SSL_set_accept_state (con->ssl);
+    else
+        SSL_set_connect_state (con->ssl);
     SSL_set_mode (con->ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER|SSL_MODE_ENABLE_PARTIAL_WRITE);
-    DEBUG1 ("Detected SSL on connection from %s", con->ip);
+    return ret > 0 ? 0 : -1;
+#else
+    return -1;
 #endif
 }
 
 
 int connection_peek (connection_t *con)
 {
-#ifdef HAVE_OPENSSL
-    if (con->ssl == NULL)   // if set then ssl is already determined, so skip this
+    if (ssl_ok && not_ssl_connection (con))   // if set then ssl is already determined, so skip this
     {
-        unsigned char arr[20];
+        unsigned char arr[12];
         int r = sock_peek (con->sock, (char*)arr, sizeof (arr));
-        if (r > 0)
+        if (r > 5)
         {
-            if (r > 5 && arr[0] == 0x16 && arr[1] == 0x3 && arr[5] == 0x1)
+            if (arr[0] == 0x16 && arr[1] == 0x3 && arr[5] == 0x1)
             {
-                connection_uses_ssl (con);
-                return 1;
+                sock_set_cork (con->sock, 0);   // make sure this is off, leave curl to decide
+                sock_set_nodelay (con->sock);
+                if (connection_uses_ssl (con, 1) == 0)
+                    DEBUG1 ("Detected SSL on connection from %s", con->ip);
             }
-            return r < 10 ? 0 : 1;
+            else if (sock_set_cork (con->sock, 1) < 0)
+                sock_set_nodelay (con->sock);
+            return 1;
         }
         if (r < 0)
             return -1;
-        con->error = 1;
+        con->error = 1;  // closed socket
     }
-#endif
+    else if (sock_set_cork (con->sock, 1) < 0)
+        sock_set_nodelay (con->sock);
     return 0;
 }
 
@@ -1081,11 +1113,13 @@ static client_t *accept_client (void)
 
         if (accept_ip_address (addr) == 0)
             break;
-        if (sock_set_blocking (sock, 0) || (sock_set_cork (sock, 1) < 0 && sock_set_nodelay (sock)))
+
+        if (sock_set_blocking (sock, 0))
         {
             WARN0 ("failed to set tcp options on client connection, dropping");
             break;
         }
+
         global_lock ();
         for (i=0; i < global.server_sockets; i++)
         {
@@ -1099,20 +1133,8 @@ static client_t *accept_client (void)
         global_unlock ();
         if (server_conn)
         {
-            client_t *client = NULL;
-            int not_using_ssl = 1;
+            client_t *client = calloc (1, sizeof (client_t));
 
-            if (ssl_ok && server_conn->ssl)
-                not_using_ssl = 0;
-            if (not_using_ssl)
-            {
-                if (sock_set_blocking (sock, 0) || (sock_set_cork (sock, 1) < 0 && sock_set_nodelay (sock)))
-                {
-                    WARN1 ("failed to set tcp options on incoming client connection %s, dropping", addr);
-                    break;
-                }
-            }
-            client = calloc (1, sizeof (client_t));
             if (client == NULL || connection_init (&client->connection, sock, addr) < 0)
             {
                 free (client);
@@ -1125,9 +1147,6 @@ static client_t *accept_client (void)
             global_lock ();
             client_register (client);
             global_unlock ();
-
-            if (not_using_ssl == 0)
-                connection_uses_ssl (&client->connection);
 
             if (server_conn->shoutcast_compat)
                 client->ops = &shoutcast_source_ops;
@@ -1143,7 +1162,7 @@ static client_t *accept_client (void)
     if (server_conn)
     {
         global_lock ();
-        server_conn->refcount--;
+        config_clear_listener (server_conn);
         global_unlock ();
     }
     sock_close (sock);
@@ -1170,13 +1189,13 @@ static int shoutcast_source_client (client_t *client)
             char *buf = refbuf->data + refbuf->len;
             char *esc_header;
             refbuf_t *r, *resp;
-            char header [128];
+            char header [256];
 
             if (remaining == 0)
                 break;
 
             ret = client_read_bytes (client, buf, remaining);
-            if (ret == 0 || con->error || global.running != ICE_RUNNING)
+            if (ret == 0 || con->error || global_state() != ICE_RUNNING)
                 break;
             if (ret < 0)
                 return 0;
@@ -1187,10 +1206,28 @@ static int shoutcast_source_client (client_t *client)
             if (refbuf->data [len] == '\0')  /* no EOL yet */
                 return 0;
 
+            const char *mount = client->server_conn->shoutcast_mount, *pw = refbuf->data;
+
+            if (isupper (refbuf->data[0]))      // possible indication of http request
+            {
+                int idx=0;
+                char method [12];
+                if (sscanf (pw, "%10[A-Z] %*[^H]HTTP%*[^\r]%n", method, &idx) == 1 && pw[idx] == '\r')
+                {
+                    INFO1 ("looks like a HTTP request (%s) on a shoutcast port, retrying", method);
+                    client->ops = &http_request_ops;
+                    client->aux_data = (uintptr_t)refbuf;
+                    return 0;
+                }
+            }
             refbuf->data [len] = '\0';  // password
 
+            if (memmem (refbuf->data, len, "!POKE", 5))
+            {
+                INFO0 ("seen !POKE on shoutcast port, likely a libshout thing. dropping");
+                break;
+            }
             // is mountpoint embedded in the password
-            const char *mount = client->server_conn->shoutcast_mount, *pw = refbuf->data;
             char *sep = strchr (refbuf->data, ':');
             if (sep && *pw == '/')
             {
@@ -1209,7 +1246,6 @@ static int shoutcast_source_client (client_t *client)
                     mount, esc_header, refbuf->data+len);
             r->len = strlen (r->data);
             free (esc_header);
-            client->respcode = 200;
             resp = refbuf_new (30);
             snprintf (resp->data, 30, "OK2\r\nicy-caps:11\r\n\r\n");
             resp->len = strlen (resp->data);
@@ -1246,40 +1282,46 @@ int setup_source_client_callback (client_t *client)
 {
     refbuf_t *buf = client->refbuf;
 
-    if (client->format_data == NULL)
+    if (client->aux_data == 0)
     {
         const char *expect = httpp_getvar (client->parser, "expect");
-        int len = buf->len - client->pos;
+        int len = buf->len - client->pos; // anything after the headers
 
         if (len)
         {
             refbuf_t *stream = refbuf_new (len);
             memcpy (stream->data, buf->data+client->pos, len);
-            buf->associated = stream;
+            buf->next = stream;
             buf->len -= len;
             DEBUG1 ("found %d bytes of stream data after headers", len);
         }
-        if (expect)
+        ice_http_t http;
+        if (ice_http_setup_flags (&http, client, 100, 0, NULL) == 0 && expect)
         {
            if (strcasecmp (expect, "100-continue") == 0)
            {
+               refbuf_t *surplus = client->refbuf;
+               if (surplus)
+                   client->refbuf = surplus->next;
+               refbuf_release (surplus);
+
+               ice_http_complete (&http);
+
                DEBUG0 ("client expects 100 continue");
-               snprintf (buf->data, PER_CLIENT_REFBUF_SIZE, "HTTP/1.1 100 Continue\r\n\r\n");
-               buf->len = strlen (buf->data);
-               client->format_data = buf;
                client->pos = 0;
                client_send_buffer_callback (client, setup_source_client_callback);
                return 0;  // need to send this straight away
            }
            INFO1 ("Received Expect header: %s", expect);
         }
+        ice_http_clear (&http);
     }
-    buf = buf->associated;
-    client->refbuf->associated = NULL;
-    refbuf_release (client->refbuf);
+    buf = buf->next;
+    client->refbuf->next = NULL;
+    refbuf_release (client->refbuf);    // drop either the incoming headers or 100 continue
     client->refbuf = buf;
     client->pos = 0;
-    client->format_data = NULL;
+    client->aux_data = 0;
     client->ops = &http_req_source_ops;
     return 0;
 }
@@ -1290,7 +1332,7 @@ static int http_client_request (client_t *client)
     refbuf_t *refbuf = client->shared_data;
     int remaining, ret = -1;
 
-    if (global.running != ICE_RUNNING)
+    if (global_state() != ICE_RUNNING || client->connection.error)
         return -1;
     if (refbuf == NULL)
     {
@@ -1303,22 +1345,24 @@ static int http_client_request (client_t *client)
     {
         char *buf = refbuf->data + refbuf->len;
 
-        if (refbuf->len == 0)
+        if (refbuf->len == 0 && not_ssl_connection (&client->connection))
         {
             if (connection_peek (&client->connection) < 0)
             {
-                client->schedule_ms = client->worker->time_ms + (not_ssl_connection (&client->connection) ? 90 : 133);
+                client->schedule_ms = client->worker->time_ms + 11; // check frequently, on incoming worker
                 return 0;
             }
         }
         ret = client_read_bytes (client, buf, remaining);
-        if (ret > 0)
+        if (ret > 0 || client->aux_data)  // use aux_data as a flag to say read what we have now
         {
             char *ptr;
 
+            if (client->aux_data && ret < 0) ret = 0;
             buf [ret] = '\0';
             refbuf->len += ret;
-            if (memcmp (refbuf->data, "<policy-file-request/>", 23) == 0)
+            buf = refbuf->data;
+            if (memmem (buf, refbuf->len, "<policy-file-request/>", 23))
             {
                 fbinfo fb;
                 memset (&fb, 0, sizeof(fb));
@@ -1334,28 +1378,28 @@ static int http_client_request (client_t *client)
             /* find a blank line */
             do
             {
-                buf = refbuf->data;
-                ptr = strstr (buf, "\r\n\r\n");
+                ptr = memmem (buf, refbuf->len, "\r\n\r\n", 4); // standard and common case
                 if (ptr)
                 {
                     ptr += 4;
                     break;
                 }
-                ptr = strstr (buf, "\n\n");
+                ptr = memmem (buf, refbuf->len, "\n\n", 2);
                 if (ptr)
                 {
                     ptr += 2;
                     break;
                 }
-                ptr = strstr (buf, "\r\r\n\r\r\n");
+                ptr = memmem (buf, refbuf->len, "\r\r\n\r\r\n", 6);
                 if (ptr)
                 {
                     ptr += 6;
                     break;
                 }
-                client->schedule_ms = client->worker->time_ms + 100;
+                client->schedule_ms = client->worker->time_ms + 40;
                 return 0;
             } while (0);
+            client->aux_data = 0;
             client->refbuf = client->shared_data;
             client->shared_data = NULL;
             client->connection.discon.time = 0;
@@ -1364,6 +1408,7 @@ static int http_client_request (client_t *client)
             if (httpp_parse (client->parser, refbuf->data, refbuf->len))
             {
                 const char *str;
+                client->pos = ptr - refbuf->data;
 
                 str = httpp_getvar (client->parser, "x-forwarded-for");
                 if (str)
@@ -1391,7 +1436,6 @@ static int http_client_request (client_t *client)
                     else
                         config_release_config();
                 }
-
                 if (useragents.filename)
                 {
                     const char *agent = httpp_getvar (client->parser, "user-agent");
@@ -1411,43 +1455,32 @@ static int http_client_request (client_t *client)
                     ERROR2("Bad protocol (%.15s) detected from %s", str, &client->connection.ip[0]);
                     return -1;
                 }
-                str = httpp_getvar (client->parser, HTTPP_VAR_VERSION);
-                if (str && strcmp (str, "1.1") == 0)
-                    client->flags |= CLIENT_KEEPALIVE;  // make default for 1.1
 
-                str = httpp_getvar (client->parser, "connection");
-                if (str)
-                {
-                    if (strcasecmp (str, "keep-alive") == 0)
-                        client->flags |= CLIENT_KEEPALIVE;
-                    else
-                        client->flags &= ~CLIENT_KEEPALIVE;
-                }
-
+                client->counter = 0;
                 auth_check_http (client);
                 switch (client->parser->req_type)
                 {
                     case httpp_req_head:
                     case httpp_req_get:
-                        refbuf->len = PER_CLIENT_REFBUF_SIZE;
+                        client_set_queue (client, NULL);
                         client->ops = &http_req_get_ops;
                         break;
                     case httpp_req_source:
                     case httpp_req_put:
-                        client->pos = ptr - refbuf->data;
                         setup_source_client_callback (client);
                         break;
                     case httpp_req_stats:
-                        refbuf->len = PER_CLIENT_REFBUF_SIZE;
+                        client_set_queue (client, NULL);
                         client->ops = &http_req_stats_ops;
                         break;
                     case httpp_req_options:
+                        client_set_queue (client, NULL);
                         return client_send_options (client);
                     default:
                         WARN1("unhandled request type from %s", client->connection.ip);
+                        client_set_queue (client, NULL);
                         return client_send_501 (client);
                 }
-                client->counter = 0;
                 return client->ops->process(client);
             }
             /* invalid http request */
@@ -1456,11 +1489,10 @@ static int http_client_request (client_t *client)
         if (ret && client->connection.error == 0)
         {
             /* scale up the retry time, very short initially, usual case */
-            uint64_t diff = client->worker->time_ms - client->counter;
-            diff >>= 1;
-            if (diff > 200)
-                diff = 200;
-            client->schedule_ms = client->worker->time_ms + 6 + diff;
+            static volatile sig_atomic_t vary = 4;
+            int diff = 2 + (++vary & 15);
+            // DEBUG2 ("client %p diff %d", client, diff);
+            client->schedule_ms = client->worker->time_ms + diff;
             return 0;
         }
     }
@@ -1488,6 +1520,7 @@ static void *connection_thread (void *arg)
     cached_file_init (&banned_ip,  config->banfile,   add_banned_ip, compare_banned_ip);
     cached_file_init (&allowed_ip, config->allowfile, NULL, NULL);
     cached_file_init (&useragents, config->agentfile, NULL, NULL);
+    cached_file_settings (&useragents, CACHED_IGNORECASE);
 
     connection_setup_sockets (config);
     header_timeout = config->header_timeout;
@@ -1497,6 +1530,7 @@ static void *connection_thread (void *arg)
 
     thread_spin_lock (&_connection_lock);
     connection_running = 1;
+
     while (connection_running)
     {
         thread_spin_unlock (&_connection_lock);
@@ -1508,7 +1542,7 @@ static void *connection_thread (void *arg)
             client->counter = client->schedule_ms = timing_get_time();
             client->connection.con_time = client->schedule_ms/1000;
             client->connection.discon.time = client->connection.con_time + header_timeout;
-            client->schedule_ms += 30;
+            client->schedule_ms += 9;
             client_add_incoming (client);
             stats_event_inc (NULL, "connections");
         }
@@ -1707,10 +1741,10 @@ static int _handle_source_request (client_t *client)
     INFO1("Source logging in at mountpoint \"%s\"", uri);
 
     client->flags &= ~CLIENT_KEEPALIVE;
-    
+
     if (uri[0] != '/')
     {
-        WARN0 ("source mountpoint not starting with /");
+        WARN1 ("mountpoint not starting with / (%s)", uri);
         return client_send_401 (client, NULL);
     }
     switch (auth_check_source (client, uri))
@@ -1718,13 +1752,11 @@ static int _handle_source_request (client_t *client)
         case 0:         /* authenticated from config file */
             return source_startup (client, uri);
         case 1:         /* auth pending */
-            break;
+            return 1;
         default:        /* failed */
             INFO1("Source (%s) attempted to login with invalid or missing password", uri);
             return client_send_401 (client, NULL);
     }
-
-    return 0;
 }
 
 
@@ -1751,12 +1783,12 @@ static void check_for_filtering (ice_config_t *config, client_t *client, char *u
     char *extension = strrchr (uri, '.');
     const char *type = httpp_get_query_param (client->parser, "type");
 
-    if ((extension && strcmp (extension+1, "flv") == 0) || 
+    if ((extension && strcmp (extension+1, "flv") == 0) ||
         (type && (strcmp (type, ".flv") == 0 || strcmp (type, ".fla") == 0)))
     {
         client->flags |= CLIENT_WANTS_FLV;
         client->flags &= ~CLIENT_KEEPALIVE;
-        DEBUG1 ("listener at %s has requested FLV", &client->connection.ip[0]);
+        DEBUG1 ("listener at %s has requested FLV", CONN_ADDR (client));
     }
     if (extension == NULL || uri == NULL)
         return;
@@ -1851,7 +1883,7 @@ static int _handle_get_request (client_t *client)
 }
 
 
-/* close any open listening sockets 
+/* close any open listening sockets
  */
 void connection_listen_sockets_close (ice_config_t *config, int all_sockets)
 {
@@ -1929,7 +1961,7 @@ int connection_setup_sockets (ice_config_t *config)
     arr_size = count = global.server_sockets;
     if (sockets_setup == 1)
     {
-        // in case of changowner, run through the first time as root, but reject the second run through as that will 
+        // in case of changowner, run through the first time as root, but reject the second run through as that will
         // be as a user (initial startup of listening thread). after that it's fine.
         sockets_setup--;
         global_unlock();
@@ -1937,6 +1969,7 @@ int connection_setup_sockets (ice_config_t *config)
     }
     if (sockets_setup > 0)
         sockets_setup--;
+
     get_ssl_certificate (config);
     if (count)
         INFO1 ("%d listening sockets already open", count);
@@ -1953,6 +1986,7 @@ int connection_setup_sockets (ice_config_t *config)
             if (sock_get_next_server_socket (sockets, &sock) < 0)
                 break;   // end of any available sockets
             socket_attempt++;
+
             if (sock == SOCK_ERROR)
                 continue;
             /* some win32 setups do not do TCP win scaling well, so allow an override */
@@ -1976,6 +2010,8 @@ int connection_setup_sockets (ice_config_t *config)
                 if (tmp) global.server_conn = tmp;
             }
 
+            if (config->shoutcast_mount && listener->shoutcast_mount == NULL)
+                listener->shoutcast_mount = (char*)xmlStrdup (XMLSTR(config->shoutcast_mount));
             sock_set_blocking (sock, 0);
             global.serversock [count] = sock;
             global.server_conn [count] = listener;
@@ -2025,14 +2061,20 @@ int connection_setup_sockets (ice_config_t *config)
 }
 
 
-void connection_reset (connection_t *con, uint64_t time_ms)
+int connection_reset (connection_t *con, uint64_t time_ms)
 {
+    if (_set_connection_peer (con, con->sock) < 0)
+    {
+        con->error = 1;
+        return -1;
+    }
     con->con_time = time_ms/1000;
     con->discon.time = con->con_time + 7;
     con->sent_bytes = 0;
 #ifdef HAVE_OPENSSL
     if (con->ssl) { SSL_shutdown (con->ssl); SSL_free (con->ssl); con->ssl = NULL; }
 #endif
+    return 0;
 }
 
 void connection_close(connection_t *con)
